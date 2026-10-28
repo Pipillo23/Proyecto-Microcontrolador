@@ -16,9 +16,15 @@ const int IN4 = PA5;
 // Seguidor de Pista (5 Canales: S1, S2, S3, S4, S5)
 const int IR_S1 = PB0;
 const int IR_S2 = PB1;
-const int IR_S3 = PB2;
-const int IR_S4 = PB10;
-const int IR_S5 = PB11;
+const int IR_S3 = PB12;
+const int IR_S4 = PB13;
+const int IR_S5 = PB14;
+
+const int SDA_RASP = PB6;
+const int SCL_RASP = PB7;
+
+const int SDA_COLOR = PB11;
+const int SCL_COLOR = PB10;
 
 // Variables de Control y Estado
 HardwareTimer *MyTim = NULL;
@@ -64,8 +70,8 @@ void setup() {
   pinMode(IR_S5, INPUT);
 
   // Inicialización Sensor de Color TCS34725 (I2C1 en PB6/PB7)
-  Wire.setSCL(PB6);
-  Wire.setSDA(PB7);
+  Wire.setSCL(SCL_COLOR);
+  Wire.setSDA(SDA_COLOR);
   Wire.begin();
   
   if (tcs.begin()) {
