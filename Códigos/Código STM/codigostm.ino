@@ -2,23 +2,30 @@
 #include <Wire.h>
 #include <Adafruit_TCS34725.h>
 #include <ArduinoJson.h>
-#include <HardwareTimer.h>
 
 // --- Definición de Pines (BluePill - STM32F103C8T6) ---
-// Motores (L298N)
-const int ENA = PA0;
-const int IN1 = PA1;
-const int IN2 = PA2;
-const int ENB = PA3;
-const int IN3 = PA4;
-const int IN4 = PA5;
+// Core: stm32duino:STM32F1 (maple), subida por ST-Link
+// Motores (L298N) - ENA/ENB con jumper (siempre habilitados)
+const int IN1 = PA1;   // PWM (TIM2 CH2) - motor izquierdo
+const int IN2 = PA2;   // dirección motor izquierdo (LOW adelante / HIGH reversa)
+const int IN3 = PA3;   // PWM (TIM2 CH4) - motor derecho
+const int IN4 = PA4;   // dirección motor derecho (LOW adelante / HIGH reversa)
 
-// Seguidor de Pista (5 Canales: S1, S2, S3, S4, S5)
+// Seguidor de Pista (5 Canales: S1 izq. extremo ... S5 der. extremo)
 const int IR_S1 = PB0;
 const int IR_S2 = PB1;
 const int IR_S3 = PB12;
 const int IR_S4 = PB13;
 const int IR_S5 = PB14;
+
+// Nivel que entrega el sensor cuando está SOBRE la línea
+const int LINEA = LOW;
+
+// --- Velocidades (PWM en IN1 e IN3, 0 a PWM_MAX) ---
+const uint16_t PWM_MAX  = 75;
+const uint16_t VEL_BASE = 37;   // velocidad normal de ambos lados
+const uint16_t VEL_CORR = 25;   // lado lento en corrección suave (S2/S4)
+const uint16_t VEL_GIRO = 25;   // reversa de la rueda interior en giro (S1/S5)
 
 const int SDA_RASP = PB6;
 const int SCL_RASP = PB7;
@@ -27,8 +34,8 @@ const int SDA_COLOR = PB11;
 const int SCL_COLOR = PB10;
 
 // Variables de Control y Estado
-HardwareTimer *MyTim = NULL;
 Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+TwoWire WireColor(2);   // I2C2 por hardware: PB10 = SCL, PB11 = SDA
 
 volatile bool is_running = false;
 int count_red = 0;
@@ -42,25 +49,38 @@ String action_blue = "turn_left";
 
 unsigned long last_serial_print = 0;
 
+// Estado actual de las salidas (lo escribe el ISR, lo imprime loop)
+volatile int16_t vel_izq = 0, vel_der = 0;   // + adelante, - reversa
+volatile const char* motor_state = "DETENIDO";
+
 // Prototipos
 void Timer_ISR();
 void process_uart_command(String json_str);
 void send_telemetry();
 void stop_motors();
-void parse_action_string(String action);
+void set_motors(int16_t izq, int16_t der, const char* state);
+void drive_motor(int pin_pwm, int pin_dir, int16_t v);
 
 void setup() {
   // Inicialización de Puertos Serie
-  Serial.begin(115200); // UART con Raspberry Pi / Monitor Serial
-  while(!Serial);
+  Serial.begin(115200);
+  while (!Serial);
 
-  // Configuración de Pines de Motores
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
+  // Motores: IN1 e IN3 con PWM (TIM2 CH2 y CH4), IN2 e IN4 como dirección
+  pinMode(IN1, PWM);
+  pinMode(IN3, PWM);
   pinMode(IN2, OUTPUT);
-  pinMode(ENB, OUTPUT);
-  pinMode(IN3, OUTPUT);
   pinMode(IN4, OUTPUT);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN4, LOW);
+
+  // PWM: 72 MHz / 72 = 1 MHz -> PWM_MAX cuentas por periodo (150 -> ~6.7 kHz)
+  Timer2.setPrescaleFactor(72);
+  Timer2.setOverflow(PWM_MAX);
+  Timer2.refresh();
+  Timer2.resume();
+
+  stop_motors();
 
   // Configuración de Pines de Sensores IR (Entrada)
   pinMode(IR_S1, INPUT);
@@ -69,22 +89,24 @@ void setup() {
   pinMode(IR_S4, INPUT);
   pinMode(IR_S5, INPUT);
 
-  // Inicialización Sensor de Color TCS34725 (I2C1 en PB6/PB7)
-  Wire.setSCL(SCL_COLOR);
-  Wire.setSDA(SDA_COLOR);
-  Wire.begin();
-  
-  if (tcs.begin()) {
+  // Inicialización Sensor de Color TCS34725 (I2C2 en PB10/PB11)
+  WireColor.begin();
+
+  if (tcs.begin(TCS34725_ADDRESS, &WireColor)) {
     Serial.println(F("[INFO] Sensor TCS34725 detectado correctamente."));
   } else {
     Serial.println(F("[ERROR] No se encontró el sensor TCS34725. Revise las conexiones I2C."));
   }
 
-  // --- Configuración de Interrupción por Timer (50 Hz / 20 ms) ---
-  MyTim = new HardwareTimer(TIM2);
-  MyTim->setOverflow(50, HERTZ_FORMAT);
-  MyTim->attachInterrupt(Timer_ISR);
-  MyTim->resume();
+  // --- Interrupción de control por Timer3 (50 Hz / 20 ms) ---
+  // Timer2 queda dedicado al PWM de los motores
+  Timer3.pause();
+  Timer3.setPeriod(20000);                       // en microsegundos
+  Timer3.setChannel1Mode(TIMER_OUTPUT_COMPARE);
+  Timer3.setCompare(TIMER_CH1, 1);
+  Timer3.attachCompare1Interrupt(Timer_ISR);
+  Timer3.refresh();
+  Timer3.resume();
 
   Serial.println(F("[INFO] Sistema inicializado y listo. Esperando comandos..."));
 }
@@ -123,48 +145,58 @@ void loop() {
     Serial.print(F(" || RGB -> R: ")); Serial.print(r);
     Serial.print(F(" G: ")); Serial.print(g);
     Serial.print(F(" B: ")); Serial.println(b);
+
+    // Copia consistente del estado de salidas
+    noInterrupts();
+    int16_t vi = vel_izq, vd = vel_der;
+    const char* st = (const char*)motor_state;
+    bool run = is_running;
+    interrupts();
+
+    Serial.print(F("[SALIDAS] Izq (IN1): ")); Serial.print(vi);
+    Serial.print(F("/")); Serial.print(PWM_MAX);
+    Serial.print(F(" | Der (IN3): ")); Serial.print(vd);
+    Serial.print(F("/")); Serial.print(PWM_MAX);
+    Serial.print(F(" || Estado: ")); Serial.print(st);
+    Serial.print(F(" | Run: ")); Serial.println(run ? "SI" : "NO");
   }
 }
 
-// Interrupción de Hardware a 50Hz (Lógica de Centrado y Seguimiento de Línea)
+// Interrupción a 50 Hz (Seguimiento de Línea con 5 sensores)
+// Disposición: S1 (izq. extremo) - S2 - S3 (centro) - S4 - S5 (der. extremo)
+// Motor A = izquierdo (IN1/IN2), Motor B = derecho (IN3/IN4)
+// Correcciones (S2/S4): bajan la velocidad de un lado
+// Giros (S1/S5): la rueda interior va en reversa a VEL_GIRO
 void Timer_ISR() {
   if (!is_running) return;
 
-  // Lectura de los 5 canales del seguidor de pista
   int s1 = digitalRead(IR_S1);
   int s2 = digitalRead(IR_S2);
   int s3 = digitalRead(IR_S3);
   int s4 = digitalRead(IR_S4);
   int s5 = digitalRead(IR_S5);
 
-  // Lógica de control básica de ejemplo basada en el sensor central (S3)
-  if (s3 == HIGH) {
-    // Centrado perfecto: Avanzar recto
-    analogWrite(ENA, 150);
-    analogWrite(ENB, 150);
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
-  } 
-  else if (s2 == HIGH) {
-    // Corrección leve hacia la izquierda
-    analogWrite(ENA, 120);
-    analogWrite(ENB, 160);
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
-  } 
-  else if (s4 == HIGH) {
-    // Corrección leve hacia la derecha
-    analogWrite(ENA, 160);
-    analogWrite(ENB, 120);
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
+  if (s3 == LINEA) {
+    // Centrado: ambos a velocidad base
+    set_motors(VEL_BASE, VEL_BASE, "AVANZA");
   }
+  else if (s2 == LINEA) {
+    // Línea un poco a la izquierda: baja el izquierdo
+    set_motors(VEL_CORR, VEL_BASE, "CORRIGE_IZQ");
+  }
+  else if (s4 == LINEA) {
+    // Línea un poco a la derecha: baja el derecho
+    set_motors(VEL_BASE, VEL_CORR, "CORRIGE_DER");
+  }
+  else if (s1 == LINEA) {
+    // Línea en el extremo izquierdo: izquierdo en reversa, derecho adelante
+    set_motors(-(int16_t)VEL_GIRO, VEL_BASE, "GIRO_IZQ");
+  }
+  else if (s5 == LINEA) {
+    // Línea en el extremo derecho: izquierdo adelante, derecho en reversa
+    set_motors(VEL_BASE, -(int16_t)VEL_GIRO, "GIRO_DER");
+  }
+  // Ningún sensor: mantiene la última salida
 }
 
 void process_uart_command(String json_str) {
@@ -184,13 +216,13 @@ void process_uart_command(String json_str) {
     is_running = true;
     Serial.println(F("[CMD] Motor iniciado"));
     send_telemetry();
-  } 
+  }
   else if (strcmp(cmd, "stop") == 0) {
     is_running = false;
     stop_motors();
     Serial.println(F("[CMD] Motor detenido"));
     send_telemetry();
-  } 
+  }
   else if (strcmp(cmd, "config") == 0) {
     if (is_running) {
       JsonDocument errDoc;
@@ -204,7 +236,7 @@ void process_uart_command(String json_str) {
       Serial.println(F("[CMD] Configuración actualizada"));
       send_telemetry();
     }
-  } 
+  }
   else if (strcmp(cmd, "fork_dir") == 0) {
     if (doc.containsKey("dir")) {
       fork_direction = doc["dir"].as<String>();
@@ -228,10 +260,31 @@ void send_telemetry() {
 }
 
 void stop_motors() {
-  analogWrite(ENA, 0);
-  analogWrite(ENB, 0);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
+  set_motors(0, 0, "DETENIDO");
+}
+
+void set_motors(int16_t izq, int16_t der, const char* state) {
+  drive_motor(IN1, IN2, izq);   // motor izquierdo
+  drive_motor(IN3, IN4, der);   // motor derecho
+  vel_izq = izq;
+  vel_der = der;
+  motor_state = state;
+}
+
+// Maneja un motor con un pin PWM y un pin digital de dirección.
+// v > 0: adelante -> dir LOW,  PWM = v
+// v < 0: reversa  -> dir HIGH, PWM = PWM_MAX - |v|
+//        (en la parte alta del PWM ambos pines quedan en HIGH = freno)
+// v = 0: ambos en LOW -> freno
+void drive_motor(int pin_pwm, int pin_dir, int16_t v) {
+  uint16_t m = (v >= 0) ? (uint16_t)v : (uint16_t)(-v);
+  if (m > PWM_MAX) m = PWM_MAX;
+
+  if (v >= 0) {
+    digitalWrite(pin_dir, LOW);
+    pwmWrite(pin_pwm, m);
+  } else {
+    digitalWrite(pin_dir, HIGH);
+    pwmWrite(pin_pwm, PWM_MAX - m);
+  }
 }
