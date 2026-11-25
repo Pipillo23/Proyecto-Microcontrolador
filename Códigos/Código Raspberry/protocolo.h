@@ -9,6 +9,8 @@
  *     Cada configuracion posible tiene su propio codigo, por eso no hay payload.
  *   - Trama de ESTADO (STM32 -> Pi): largo fijo de 17 bytes, la Pi la lee
  *     periodicamente (en I2C el esclavo no puede transmitir por iniciativa propia).
+ *     Del sensor de color solo viajan el color detectado y los conteos R/G/B;
+ *     la lectura cruda y su normalizacion se quedan en el STM32.
  *
  * Reglas heredadas de la SPEC:
  *   - Multibyte en little-endian (byte bajo primero).
@@ -130,6 +132,10 @@ typedef struct {
     uint16_t cuenta_b;
 } estado_t;
 
+/* Escala de la normalizacion del sensor de color (la usa solo el STM32):
+ * 1000 = el canal vale lo mismo que el canal clear */
+#define NORM_ESCALA            1000u
+
 #define DEC_OK                 0
 #define DEC_ERR_CRC           -1
 #define DEC_ERR_VERSION       -2
@@ -146,6 +152,18 @@ static inline uint16_t crc16(const uint8_t *d, uint16_t n)
             c = (c & 0x8000u) ? (uint16_t)((c << 1) ^ 0x1021u) : (uint16_t)(c << 1);
     }
     return c;
+}
+
+/* Normalizacion por iluminacion: cada canal se divide entre el canal clear.
+ *   n = X * 1000 / C      (por mil de C)
+ * Asi el resultado depende del COLOR de la superficie y no de cuanta luz
+ * llega al sensor (altura, LED, luz ambiente). Con C = 0 devuelve 0.
+ * Solo enteros: el STM32F103 no tiene FPU.                                */
+static inline uint16_t color_normalizar(uint16_t canal, uint16_t clear)
+{
+    if (clear == 0u) return 0u;
+    uint32_t n = (uint32_t)canal * NORM_ESCALA / clear;
+    return (uint16_t)(n > 0xFFFFu ? 0xFFFFu : n);
 }
 
 static inline int cmd_es_color(uint8_t c) { return c >= CMD_COL_PRIMERO && c <= CMD_COL_ULTIMO; }
@@ -326,3 +344,4 @@ static inline const char *bif_nombre(uint8_t c)
 }
 
 #endif /* PROTOCOLO_H */
+
