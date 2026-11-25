@@ -230,8 +230,6 @@ public:
     const estado_t& estado() const { return st_; }
     bool     sincronizado() const { return sincronizado_; }
     bool     versionMala() const { return versionMala_; }
-    uint32_t lecturasOk() const { return lecturasOk_; }
-    uint32_t errores() const { return errores_; }
     bool     startBloqueado() const { return startBloqueado_; }
 
 private:
@@ -240,7 +238,6 @@ private:
     void quitarDeCola(uint8_t cmd);
     void registrarError(uint64_t now)
     {
-        errores_++;
         tUltErr_ = now;
     }
     void enviarPendiente(uint64_t now);
@@ -256,7 +253,6 @@ private:
     bool     sincronizado_ = false;     /* ya se leyo al menos una trama valida       */
     bool     versionMala_ = false;
     uint64_t tUltOk_ = 0, tUltErr_ = 0, tUltEnvio_ = 0;
-    uint32_t lecturasOk_ = 0, errores_ = 0;
     int      pubIguales_ = 0;
     uint8_t  sigSeq_ = 0;
 
@@ -370,7 +366,6 @@ void Enlace::procesarEstado(const estado_t& e, uint64_t now)
 
     st_ = e;
     tUltOk_ = now;
-    lecturasOk_++;
     versionMala_ = false;
 
     if (primera) {
@@ -744,8 +739,7 @@ void Interfaz::dibujar(uint64_t now)
 
     const int nv = enlace_.nivel(now);
     const char* txt = nv == 2 ? VERDE_T "OK" : nv == 1 ? AMAR_T "DEGRADADO" : ROJO_T "SIN CONEXION";
-    p("Comunicacion : %s" NORM_T "   (lecturas OK %u, errores %u)%s" FIN, txt,
-      static_cast<unsigned>(enlace_.lecturasOk()), static_cast<unsigned>(enlace_.errores()),
+    p("Comunicacion : %s" NORM_T "%s" FIN, txt,
       enlace_.versionMala() ? ROJO_T "  VERSION INCOMPATIBLE" NORM_T : "");
 
     const estado_t& e = enlace_.estado();
