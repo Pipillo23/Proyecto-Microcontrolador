@@ -53,17 +53,50 @@ const int SDA_COLOR = PB11;
 const int LED_PLACA = PC13;
 
 // --- Sensor de color ---
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+// Integración de 24 ms (antes 50 ms). Un segmento de 5 cm a 0.5 m/s pasa bajo el
+// sensor en 100 ms: caben ~4 mediciones y el color se confirma con 2 seguidas.
+// Máximo de cuenta con 24 ms: (256 - 0xF6) * 1024 = 10240.
+#define COLOR_T_INTEGRACION TCS34725_INTEGRATIONTIME_24MS
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(COLOR_T_INTEGRACION, TCS34725_GAIN_4X);
+const uint32_t CUENTA_MAX_COLOR = (256u - (uint8_t)COLOR_T_INTEGRACION) * 1024u;
 #if MODO_SIN_PI
 TwoWire WireColor(2);            // I2C2 por hardware con la librería Wire (como el código original)
 #define BUS_COLOR WireColor
 #else
 #define BUS_COLOR Wire1          // I2C2 de la librería Wire_slave
 #endif
+
+// Cómo se entera el STM32 de que hay una medición nueva:
+//   1 = POR INTERRUPCIÓN: el pin INT del TCS34725 baja al terminar cada medición
+//       (registro PERS = 0 + AIEN). Cablear INT -> PA8. La ISR solo levanta una
+//       bandera; la lectura I2C se hace en loop. Si se pierde un flanco, cada
+//       T_RESPALDO_COLOR_MS se consulta el registro STATUS para recuperarse.
+//   0 = POR SONDEO (polling): sin cable INT, se consulta el bit AINT de STATUS
+//       cada T_SONDEO_COLOR_MS.
+#define COLOR_POR_INTERRUPCION 1
+const int COLOR_INT = PA8;       // INT del TCS34725: open-drain, activo en bajo. EXTI8 no
+                                 // choca con los IR (EXTI 0, 1, 12, 13 y 14)
+const unsigned long T_RESPALDO_COLOR_MS = 100;
+const unsigned long T_SONDEO_COLOR_MS   = 5;
+volatile bool color_listo = false;               // la levanta ISR_Color
 bool tcs_ok = false;
-uint16_t col_r = 0, col_g = 0, col_b = 0, col_c = 0;
-unsigned long t_ult_color = 0;
-const unsigned long T_LECTURA_COLOR_MS = 60;    // > 50 ms de integración
+bool color_falla = false;                        // 5 lecturas I2C fallidas seguidas
+uint8_t fallas_color = 0;
+uint16_t col_r = 0, col_g = 0, col_b = 0, col_c = 0;   // última lectura cruda
+unsigned long t_ult_consulta_color = 0;
+
+// --- Calibración del color (ver clasificar_color) ---
+// Referencia de BLANCO: valores normalizados (por mil de C) y C crudo sobre papel
+// blanco. Con el USB conectado, poner papel blanco bajo el sensor y enviar 'b' por
+// el Monitor Serie: se toman los valores actuales y se imprimen para dejarlos fijos aquí.
+uint16_t blanco_r = 333, blanco_g = 333, blanco_b = 333;
+uint16_t blanco_c = 2000;
+const uint16_t OSCURO_PCT  = 15;     // C < 15 % del C del blanco -> negro (tape) o nada
+const uint16_t DOMINIO_MIN = 1150;   // el canal ganador debe superar al blanco en 15 %
+const uint16_t MARGEN_MIN  = 150;    // y ganarle al segundo canal por 0.15 (relativo al blanco)
+const uint8_t  N_CONFIRMA  = 2;      // mediciones seguidas iguales para aceptar un color
+uint8_t color_candidato = COLOR_NINGUNO, n_iguales = 0;
+uint8_t ultimo_contado  = COLOR_NINGUNO; // evita contar dos veces el mismo segmento
 
 // --- Estado del carro según protocolo.h (lo maneja loop) ---
 volatile uint8_t estado = EST_IDLE;             // EST_*; lo lee también ISR_Linea
@@ -96,6 +129,13 @@ volatile const char* motor_state = "DETENIDO";
 
 // Prototipos
 void ISR_Linea();
+void ISR_Color();
+void atender_sensor_color();
+bool tcs_leer(uint8_t reg, uint8_t *buf, uint8_t n);
+void registrar_falla_color();
+uint8_t clasificar_color(uint16_t c, uint16_t r, uint16_t g, uint16_t b);
+void procesar_color();
+void calibrar_blanco();
 #if !MODO_SIN_PI
 void i2c_recibir(int cantidad);
 void i2c_responder();
@@ -147,6 +187,18 @@ void setup() {
   }
   if (tcs_ok) {
     Serial.println(F("[INFO] Sensor TCS34725 detectado correctamente."));
+    // Interrupción en CADA fin de medición ("dato listo"), sin umbrales: con PERS = 0
+    // el sensor activa AINT (y baja INT) cada ciclo, sin importar AILT/AIHT.
+    tcs.write8(TCS34725_PERS, TCS34725_PERS_NONE);
+    tcs.setInterrupt(true);          // AIEN = 1
+    tcs.clearInterrupt();            // arranca con INT en alto
+#if COLOR_POR_INTERRUPCION
+    pinMode(COLOR_INT, INPUT_PULLUP);              // INT es open-drain: necesita pull-up
+    attachInterrupt(COLOR_INT, ISR_Color, FALLING);
+    Serial.println(F("[INFO] Color por interrupción (INT del TCS34725 en PA8)."));
+#else
+    Serial.println(F("[INFO] Color por sondeo del registro STATUS."));
+#endif
   } else {
     Serial.println(F("[ERROR] No se encontró el sensor TCS34725. Revise las conexiones I2C."));
   }
@@ -193,13 +245,17 @@ void loop() {
     arranco = true;
     arrancar();
   }
-  // Con el USB conectado: 's' arranca, 'x' detiene (desde el Monitor Serie)
+#endif
+  // Con el USB conectado (Monitor Serie): 'b' toma la referencia de blanco del sensor
+  // de color. En MODO_SIN_PI además 's' arranca y 'x' detiene.
   if (Serial.available()) {
     char c = Serial.read();
-    if (c == 's' && estado == EST_IDLE) arrancar();
+    if (c == 'b') calibrar_blanco();
+#if MODO_SIN_PI
+    else if (c == 's' && estado == EST_IDLE) arrancar();
     else if (c == 'x') detener(EST_IDLE);
-  }
 #endif
+  }
 
   // 1) Ejecutar los comandos que llegaron por I2C, en orden
   while (cola_ini != cola_fin) {
@@ -229,14 +285,8 @@ void loop() {
     Serial.println(estado_nombre(est));
   }
 
-  // 3) Leer el sensor de color sin bloquear (getRawData() se queda ~50 ms en un delay)
-  if (tcs_ok && millis() - t_ult_color >= T_LECTURA_COLOR_MS) {
-    t_ult_color = millis();
-    col_c = tcs.read16(TCS34725_CDATAL);
-    col_r = tcs.read16(TCS34725_RDATAL);
-    col_g = tcs.read16(TCS34725_GDATAL);
-    col_b = tcs.read16(TCS34725_BDATAL);
-  }
+  // 3) Sensor de color: si hay medición nueva, leer, normalizar, clasificar y contar
+  atender_sensor_color();
 
   // 4) Refrescar la trama de estado cada 10 ms
   if (millis() - t_ult_publicacion >= T_PUBLICACION_STM_MS) {
@@ -261,9 +311,22 @@ void loop() {
     Serial.print(F(" | S3 (Centro): ")); Serial.print(s3);
     Serial.print(F(" | S4: ")); Serial.print(s4);
     Serial.print(F(" | S5: ")); Serial.print(s5);
-    Serial.print(F(" || RGB -> R: ")); Serial.print(col_r);
+    Serial.println();
+
+    // Sensor de color: crudo, normalizado (por mil de C) y color confirmado
+    Serial.print(F("[COLOR] C: ")); Serial.print(col_c);
+    Serial.print(F(" R: ")); Serial.print(col_r);
     Serial.print(F(" G: ")); Serial.print(col_g);
-    Serial.print(F(" B: ")); Serial.println(col_b);
+    Serial.print(F(" B: ")); Serial.print(col_b);
+    Serial.print(F(" | norm r: ")); Serial.print(color_normalizar(col_r, col_c));
+    Serial.print(F(" g: ")); Serial.print(color_normalizar(col_g, col_c));
+    Serial.print(F(" b: ")); Serial.print(color_normalizar(col_b, col_c));
+    Serial.print(F(" | color: ")); Serial.print(color_nombre(color_actual));
+    Serial.print(F(" | conteo R/G/B: ")); Serial.print(count_red);
+    Serial.print(F("/")); Serial.print(count_green);
+    Serial.print(F("/")); Serial.print(count_blue);
+    if (color_falla) Serial.print(F(" | SENSOR EN FALLA"));
+    Serial.println();
 
     // Copia consistente del estado de salidas
     noInterrupts();
@@ -318,6 +381,145 @@ void ISR_Linea() {
     set_motors(VEL_BASE, -(int16_t)VEL_CORR, "CORRIGE_DER");
   }
   // Ningún sensor del medio: mantiene la última salida
+}
+
+// ============================================================================
+// SENSOR DE COLOR TCS34725 (I2C2, el STM32 es MAESTRO de este bus)
+// ============================================================================
+
+// ISR del pin INT del TCS34725: terminó una medición. No se hace I2C aquí: la
+// transferencia maestra de I2C2 usa sus propias interrupciones y espera, y no debe
+// bloquear al esclavo I2C1 de la Pi. Solo se avisa a loop.
+void ISR_Color() {
+  color_listo = true;
+}
+
+// Lee n registros seguidos del TCS34725 en UNA transacción (auto-incremento).
+// Leer los 8 bytes juntos asegura que C, R, G y B son de la misma medición.
+bool tcs_leer(uint8_t reg, uint8_t *buf, uint8_t n) {
+  BUS_COLOR.beginTransmission(TCS34725_ADDRESS);
+  BUS_COLOR.write((uint8_t)(TCS34725_COMMAND_BIT | 0x20 | reg));  // 0x20 = auto-incremento
+  if (BUS_COLOR.endTransmission() != 0) return false;
+  if (BUS_COLOR.requestFrom(TCS34725_ADDRESS, (int)n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = (uint8_t)BUS_COLOR.read();
+  return true;
+}
+
+void registrar_falla_color() {
+  if (fallas_color < 255) fallas_color++;
+  if (fallas_color >= 5) color_falla = true;     // la Pi lo ve como BAN_SENSOR_COLOR_FALLA
+}
+
+// Llamada en cada vuelta de loop. Solo hace I2C cuando hay (o puede haber) dato nuevo.
+void atender_sensor_color() {
+  if (!tcs_ok) return;
+#if COLOR_POR_INTERRUPCION
+  const unsigned long t_consulta = T_RESPALDO_COLOR_MS;  // respaldo si se pierde un flanco
+#else
+  const unsigned long t_consulta = T_SONDEO_COLOR_MS;    // sondeo normal
+#endif
+  unsigned long ahora = millis();
+  bool hay_dato = false;
+
+  if (color_listo) {                    // aviso del pin INT
+    color_listo = false;
+    hay_dato = true;
+  } else if (ahora - t_ult_consulta_color >= t_consulta) {
+    t_ult_consulta_color = ahora;
+    uint8_t st;
+    if (!tcs_leer(TCS34725_STATUS, &st, 1)) { registrar_falla_color(); return; }
+    hay_dato = (st & TCS34725_STATUS_AINT) != 0;      // AINT = medición nueva sin leer
+  }
+  if (!hay_dato) return;
+  t_ult_consulta_color = ahora;
+
+  uint8_t b[8];                         // CDATAL, CDATAH, RDATAL, ... BDATAH (0x14..0x1B)
+  if (!tcs_leer(TCS34725_CDATAL, b, 8)) { registrar_falla_color(); return; }
+  tcs.clearInterrupt();                 // borra AINT y suelta INT: la próxima medición da un flanco nuevo
+  fallas_color = 0;
+  color_falla = false;
+
+  col_c = (uint16_t)(b[0] | (b[1] << 8));
+  col_r = (uint16_t)(b[2] | (b[3] << 8));
+  col_g = (uint16_t)(b[4] | (b[5] << 8));
+  col_b = (uint16_t)(b[6] | (b[7] << 8));
+  procesar_color();
+}
+
+// Decide qué color hay bajo el sensor a partir de una medición cruda.
+//  1) Normalizar por iluminación: n = canal * 1000 / C (protocolo.h). Quita el
+//     efecto de la altura, del LED y de la luz ambiente.
+//  2) Comparar con el blanco: rel = n * 1000 / n_blanco. Sobre blanco los tres
+//     canales dan 1000; así se corrige que el sensor no ve igual los tres colores.
+//  3) Un canal debe sobresalir: rel >= DOMINIO_MIN y ganarle al segundo por MARGEN_MIN.
+uint8_t clasificar_color(uint16_t c, uint16_t r, uint16_t g, uint16_t b) {
+  if (c >= CUENTA_MAX_COLOR) return COLOR_INDETERMINADO;              // saturado
+  if ((uint32_t)c * 100u < (uint32_t)blanco_c * OSCURO_PCT) return COLOR_NINGUNO;  // negro
+
+  const uint16_t n[3]   = { color_normalizar(r, c), color_normalizar(g, c), color_normalizar(b, c) };
+  const uint16_t ref[3] = { blanco_r, blanco_g, blanco_b };
+  uint32_t rel[3];
+  for (uint8_t i = 0; i < 3; i++)
+    rel[i] = ref[i] ? (uint32_t)n[i] * 1000u / ref[i] : 0;
+
+  uint8_t gana = 0;
+  for (uint8_t i = 1; i < 3; i++)
+    if (rel[i] > rel[gana]) gana = i;
+  uint32_t segundo = 0;
+  for (uint8_t i = 0; i < 3; i++)
+    if (i != gana && rel[i] > segundo) segundo = rel[i];
+
+  if (rel[gana] < DOMINIO_MIN || rel[gana] - segundo < MARGEN_MIN)
+    return COLOR_NINGUNO;                  // blanco, gris o un color que no es R, G ni B
+  return (uint8_t)(COLOR_ROJO + gana);     // 0 -> ROJO, 1 -> VERDE, 2 -> AZUL
+}
+
+// Antirrebote y conteo. Un color se acepta tras N_CONFIRMA mediciones iguales
+// seguidas, y un segmento se cuenta una sola vez: para volver a contar hay que
+// salir del segmento (NINGUNO confirmado) o pasar a otro color.
+void procesar_color() {
+  uint8_t c = clasificar_color(col_c, col_r, col_g, col_b);
+  if (c == color_candidato) {
+    if (n_iguales < 255) n_iguales++;
+  } else {
+    color_candidato = c;
+    n_iguales = 1;
+  }
+  if (n_iguales < N_CONFIRMA) return;
+
+  color_actual = c;                                  // lo que ve la Pi en ST_COLOR
+  if (c == COLOR_NINGUNO) { ultimo_contado = COLOR_NINGUNO; return; }
+  if (c == COLOR_INDETERMINADO || c == ultimo_contado) return;
+  ultimo_contado = c;
+
+  // Solo se cuenta avanzando por la pista (no detenido ni en una acción)
+  uint8_t est = estado;
+  if (est != EST_RUN && est != EST_BIFURCACION) return;
+
+  uint16_t *cuenta = (c == COLOR_ROJO) ? &count_red : (c == COLOR_VERDE) ? &count_green : &count_blue;
+  if (*cuenta < 0xFFFFu) (*cuenta)++;
+  Serial.print(F("[COLOR] Segmento ")); Serial.print(color_nombre(c));
+  Serial.print(F(" #")); Serial.println(*cuenta);
+}
+
+// 'b' por el Monitor Serie: toma la medición actual como referencia de blanco
+void calibrar_blanco() {
+  if (!tcs_ok || col_c == 0) {
+    Serial.println(F("[CAL] No hay una lectura válida del sensor de color."));
+    return;
+  }
+  uint16_t r = color_normalizar(col_r, col_c);
+  uint16_t g = color_normalizar(col_g, col_c);
+  uint16_t b = color_normalizar(col_b, col_c);
+  if (r == 0 || g == 0 || b == 0) {
+    Serial.println(F("[CAL] Un canal vale 0: ¿el sensor está sobre papel blanco?"));
+    return;
+  }
+  blanco_c = col_c; blanco_r = r; blanco_g = g; blanco_b = b;
+  Serial.print(F("[CAL] Blanco tomado. Para dejarlo fijo, copie en el código: blanco_r = "));
+  Serial.print(r); Serial.print(F(", blanco_g = ")); Serial.print(g);
+  Serial.print(F(", blanco_b = ")); Serial.print(b);
+  Serial.print(F("; blanco_c = ")); Serial.println(col_c);
 }
 
 // ============================================================================
@@ -399,7 +601,7 @@ void publicar_estado() {
   e.estado        = estado;
   e.banderas      = (uint8_t)(banderas_fijas
                     | (linea_perdida() ? BAN_LINEA_PERDIDA : 0)
-                    | (tcs_ok ? 0 : BAN_SENSOR_COLOR_FALLA));
+                    | ((tcs_ok && !color_falla) ? 0 : BAN_SENSOR_COLOR_FALLA));
   e.cfg_color     = cfg_color;
   e.cfg_bif       = cfg_bif;
   e.color         = color_actual;
