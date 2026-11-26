@@ -8,10 +8,8 @@
 #if MODO_SIN_PI
 #include <Wire.h>                // I2C solo maestro (el sensor de color no necesita más)
 #else
-#include <Wire_slave.h>          // I2C maestro + esclavo del núcleo Maple. Debe ir ANTES de
-                                 // cualquier librería que incluya <Wire.h> (Adafruit_TCS34725)
+#include <Wire_slave.h>          // I2C maestro + esclavo del núcleo Maple
 #endif
-#include <Adafruit_TCS34725.h>
 #include "protocolo.h"           // mismo archivo que usa la Raspberry Pi (va en la carpeta del sketch)
 const unsigned long T_ARRANQUE_MS = 3000;   // tiempo para poner el carro en la pista
 
@@ -28,29 +26,16 @@ const int IR_S1 = PB14;
 const int IR_S2 = PB0;
 const int IR_S3 = PB12;
 const int IR_S4 = PB13;
-const int IR_S5 = PA7;
+const int IR_S5 = PA9;
 
 // Nivel que entrega el sensor cuando está SOBRE la línea
 const int LINEA = HIGH;
 
 // --- Velocidades (PWM en IN1 e IN3, 0 a PWM_MAX) ---
-const uint16_t PWM_MAX     = 65535;
-const int32_t  VEL_BASE    = 25000;   // velocidad en recta
-const int32_t  VEL_REV_MAX = 15000;   // reversa máxima de la rueda interior en curvas cerradas
-
-// --- Control PD de posición (ISR_Control, cada 2 ms por Timer3) ---
-// Error = posición de la línea medida en "sensores":
-//   -2 bajo S1 ... -1 bajo S2 ... 0 bajo S3 ... +1 bajo S4 ... +2 bajo S5
-//   (dos sensores vecinos a la vez dan el punto medio: -1.5, -0.5, +0.5, +1.5)
-// Se pueden cambiar por el Monitor Serie: p8000  d500  f0.3
-float Kp          = 8000.0f;  // cuentas de PWM por sensor de error
-float Kd          = 500.0f;   // cuentas de PWM por (sensor/s) de cambio del error
-float FRENO_CURVA = 0.30f;    // con el error máximo la velocidad base baja 30 %
-const uint32_t T_CONTROL_US = 2000;                  // 500 Hz
-const float    DT_CONTROL   = T_CONTROL_US * 1e-6f;
-const float    E_PERDIDA    = 2.5f;   // error cuando la línea se salió por un extremo
-volatile float error_linea  = 0;      // lo escribe ISR_Linea, lo lee ISR_Control
-float e_anterior = 0, d_filtrada = 0; // solo ISR_Control (y arrancar)
+const uint16_t PWM_MAX  = 65535;   
+const uint16_t VEL_BASE = 25000;   
+const uint16_t VEL_CORR = 0;   
+const uint16_t VEL_GIRO = 0;   
 
 // I2C1 por hardware, ESCLAVO 0x42 hacia la Raspberry Pi (pines fijos del periférico):
 //   PB6 = SCL -> GPIO3 (pin 5) de la Pi      PB7 = SDA -> GPIO2 (pin 3) de la Pi      GND común
@@ -69,8 +54,29 @@ const int LED_PLACA = PC13;
 // Integración de 24 ms (antes 50 ms). Un segmento de 5 cm a 0.5 m/s pasa bajo el
 // sensor en 100 ms: caben ~4 mediciones y el color se confirma con 2 seguidas.
 // Máximo de cuenta con 24 ms: (256 - 0xF6) * 1024 = 10240.
+//
+// El sensor se maneja con escrituras/lecturas I2C directas, SIN la librería de Adafruit:
+// su begin() (con Adafruit_BusIO) se quedaba trabado con la Wire del núcleo Maple, que
+// no tiene tiempo límite. Las mismas transferencias hechas a mano sí funcionan.
+#define TCS34725_ADDRESS               0x29
+#define TCS34725_COMMAND_BIT           0x80
+#define TCS34725_AUTOINCREMENTO        0x20
+#define TCS34725_LIMPIAR_INT           0xE6   // comando especial: borra la interrupción (AINT)
+#define TCS34725_ENABLE                0x00
+#define TCS34725_ENABLE_PON            0x01   // encendido del oscilador interno
+#define TCS34725_ENABLE_AEN            0x02   // mediciones RGBC
+#define TCS34725_ENABLE_AIEN           0x10   // interrupción en el pin INT
+#define TCS34725_ATIME                 0x01
+#define TCS34725_PERS                  0x0C
+#define TCS34725_PERS_NONE             0x00   // interrupción en cada fin de medición
+#define TCS34725_CONTROL               0x0F
+#define TCS34725_GAIN_4X               0x01
+#define TCS34725_ID                    0x12   // 0x44 (TCS34721/5) o 0x4D (TCS34723/7)
+#define TCS34725_STATUS                0x13
+#define TCS34725_STATUS_AINT           0x10
+#define TCS34725_CDATAL                0x14
+#define TCS34725_INTEGRATIONTIME_24MS  0xF6
 #define COLOR_T_INTEGRACION TCS34725_INTEGRATIONTIME_24MS
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(COLOR_T_INTEGRACION, TCS34725_GAIN_4X);
 const uint32_t CUENTA_MAX_COLOR = (256u - (uint8_t)COLOR_T_INTEGRACION) * 1024u;
 #if MODO_SIN_PI
 TwoWire WireColor(2);            // I2C2 por hardware con la librería Wire (como el código original)
@@ -88,7 +94,7 @@ TwoWire WireColor(2);            // I2C2 por hardware con la librería Wire (com
 //       cada T_SONDEO_COLOR_MS.
 #define COLOR_POR_INTERRUPCION 1
 const int COLOR_INT = PA8;       // INT del TCS34725: open-drain, activo en bajo. EXTI8 no
-                                 // choca con los IR (EXTI 0, 1, 12, 13 y 14)
+                                 // choca con los IR (EXTI 0, 9, 12, 13 y 14)
 const unsigned long T_RESPALDO_COLOR_MS = 100;
 const unsigned long T_SONDEO_COLOR_MS   = 5;
 volatile bool color_listo = false;               // la levanta ISR_Color
@@ -137,16 +143,17 @@ unsigned long t_ult_publicacion = 0;
 unsigned long last_serial_print = 0;
 
 // Estado actual de las salidas (lo escribe el ISR, lo imprime loop)
-volatile int32_t vel_izq = 0, vel_der = 0;   // + adelante, - reversa
+volatile int16_t vel_izq = 0, vel_der = 0;   // + adelante, - reversa
 volatile const char* motor_state = "DETENIDO";
 
 // Prototipos
 void ISR_Linea();
-void ISR_Control();
-void imprimir_pd();
 void ISR_Color();
 void atender_sensor_color();
 bool tcs_leer(uint8_t reg, uint8_t *buf, uint8_t n);
+bool tcs_escribir(uint8_t reg, uint8_t valor);
+bool tcs_limpiar_interrupcion();
+bool tcs_iniciar();
 void registrar_falla_color();
 uint8_t clasificar_color(uint16_t c, uint16_t r, uint16_t g, uint16_t b);
 void procesar_color();
@@ -162,14 +169,13 @@ void arrancar();
 void detener(uint8_t nuevo_estado);
 bool linea_perdida();
 void stop_motors();
-void set_motors(int32_t izq, int32_t der, const char* state);
-void drive_motor(int pin_pwm, int pin_dir, int32_t v);
+void set_motors(int16_t izq, int16_t der, const char* state);
+void drive_motor(int pin_pwm, int pin_dir, int16_t v);
 
 void setup() {
   // Puerto serie USB: solo para depurar con la PC (la Pi se comunica únicamente por I2C).
   // Sin "while (!Serial);": con el carro en batería no hay USB y el programa se quedaría ahí.
   Serial.begin(115200);
-  Serial.setTimeout(50);           // para leer las ganancias (p, d, f) sin trabar el loop
 
   pinMode(LED_PLACA, OUTPUT);
   digitalWrite(LED_PLACA, LOW);    // LED encendido: inicializando
@@ -199,15 +205,10 @@ void setup() {
   // bus del núcleo Maple (i2c_bus_reset). Por eso se revisan las líneas antes.
   if (bus_con_pullups(SCL_COLOR, SDA_COLOR)) {
     BUS_COLOR.begin();
-    tcs_ok = tcs.begin(TCS34725_ADDRESS, &BUS_COLOR);
+    tcs_ok = tcs_iniciar();          // ID, 24 ms, ganancia 4x, INT en cada medición
   }
   if (tcs_ok) {
     Serial.println(F("[INFO] Sensor TCS34725 detectado correctamente."));
-    // Interrupción en CADA fin de medición ("dato listo"), sin umbrales: con PERS = 0
-    // el sensor activa AINT (y baja INT) cada ciclo, sin importar AILT/AIHT.
-    tcs.write8(TCS34725_PERS, TCS34725_PERS_NONE);
-    tcs.setInterrupt(true);          // AIEN = 1
-    tcs.clearInterrupt();            // arranca con INT en alto
 #if COLOR_POR_INTERRUPCION
     pinMode(COLOR_INT, INPUT_PULLUP);              // INT es open-drain: necesita pull-up
     attachInterrupt(COLOR_INT, ISR_Color, FALLING);
@@ -240,7 +241,7 @@ void setup() {
 #endif
 
   // --- Interrupciones externas por cambio en los pines del seguidor ---
-  // Cada sensor usa su propia línea EXTI (0, 1, 12, 13, 14), así que no chocan.
+  // Cada sensor usa su propia línea EXTI (14, 0, 12, 13 y 9), así que no chocan.
   // CHANGE: entra tanto cuando un sensor ve la línea como cuando la deja de ver.
   // Timer2 queda dedicado al PWM de los motores.
   attachInterrupt(IR_S1, ISR_Linea, CHANGE);
@@ -248,17 +249,6 @@ void setup() {
   attachInterrupt(IR_S3, ISR_Linea, CHANGE);
   attachInterrupt(IR_S4, ISR_Linea, CHANGE);
   attachInterrupt(IR_S5, ISR_Linea, CHANGE);
-  ISR_Linea();                     // posición inicial de la línea
-
-  // --- Interrupción de control por Timer3 (500 Hz / 2 ms): el PD ---
-  // Timer2 genera el PWM; Timer3 solo marca el tiempo (canal 1 sin salida a pin).
-  Timer3.pause();
-  Timer3.setPeriod(T_CONTROL_US);                // en microsegundos
-  Timer3.setChannel1Mode(TIMER_OUTPUT_COMPARE);
-  Timer3.setCompare(TIMER_CH1, 1);
-  Timer3.attachCompare1Interrupt(ISR_Control);
-  Timer3.refresh();
-  Timer3.resume();
 
   digitalWrite(LED_PLACA, HIGH);   // LED apagado: setup() terminó
   Serial.println(F("[INFO] Sistema inicializado."));
@@ -278,9 +268,6 @@ void loop() {
   if (Serial.available()) {
     char c = Serial.read();
     if (c == 'b') calibrar_blanco();
-    else if (c == 'p') { Kp = Serial.parseFloat(); imprimir_pd(); }
-    else if (c == 'd') { Kd = Serial.parseFloat(); imprimir_pd(); }
-    else if (c == 'f') { FRENO_CURVA = Serial.parseFloat(); imprimir_pd(); }
 #if MODO_SIN_PI
     else if (c == 's' && estado == EST_IDLE) arrancar();
     else if (c == 'x') detener(EST_IDLE);
@@ -360,8 +347,7 @@ void loop() {
 
     // Copia consistente del estado de salidas
     noInterrupts();
-    int32_t vi = vel_izq, vd = vel_der;
-    float err = error_linea;
+    int16_t vi = vel_izq, vd = vel_der;
     const char* st = (const char*)motor_state;
     interrupts();
 
@@ -369,8 +355,7 @@ void loop() {
     Serial.print(F("/")); Serial.print(PWM_MAX);
     Serial.print(F(" | Der (IN3): ")); Serial.print(vd);
     Serial.print(F("/")); Serial.print(PWM_MAX);
-    Serial.print(F(" || error: ")); Serial.print(err);
-    Serial.print(F(" | Motores: ")); Serial.print(st);
+    Serial.print(F(" || Motores: ")); Serial.print(st);
     Serial.print(F(" | Estado: ")); Serial.println(estado_nombre(estado));
 
     Serial.print(F("[PROTOCOLO] ult_seq: ")); Serial.print(ult_seq);
@@ -381,76 +366,38 @@ void loop() {
   }
 }
 
-// Interrupción externa por cambio en cualquiera de los 5 sensores de línea.
-// Ya NO mueve los motores: solo calcula dónde está la línea (error_linea) y detecta
-// intersecciones. Los motores los maneja ISR_Control a frecuencia fija.
+// Interrupción externa por cambio en cualquiera de los 5 sensores de línea
 // Disposición: S1 (izq. extremo) - S2 - S3 (centro) - S4 - S5 (der. extremo)
+// Motor A = izquierdo (IN1/IN2), Motor B = derecho (IN3/IN4)
+// Seguimiento: solo S2, S3 y S4. Los extremos S1 y S5 solo detectan intersecciones.
+// Correcciones (S2/S4): bajan la velocidad de un lado
 void ISR_Linea() {
-  bool v1 = digitalRead(IR_S1) == LINEA;
-  bool v2 = digitalRead(IR_S2) == LINEA;
-  bool v3 = digitalRead(IR_S3) == LINEA;
-  bool v4 = digitalRead(IR_S4) == LINEA;
-  bool v5 = digitalRead(IR_S5) == LINEA;
+  if (estado != EST_RUN && estado != EST_BIFURCACION) return;
+
+  int s1 = digitalRead(IR_S1);
+  int s2 = digitalRead(IR_S2);
+  int s3 = digitalRead(IR_S3);
+  int s4 = digitalRead(IR_S4);
+  int s5 = digitalRead(IR_S5);
 
   // Intersección: los dos extremos ven línea a la vez. Se avisa a la Pi con
   // EST_BIFURCACION y se vuelve a RUN cuando los extremos dejan de verla.
-  bool interseccion = v1 && v5;
-  if (estado == EST_RUN || estado == EST_BIFURCACION) {
-    if (interseccion) estado = EST_BIFURCACION;
-    else if (estado == EST_BIFURCACION) estado = EST_RUN;
+  if (s1 == LINEA && s5 == LINEA) estado = EST_BIFURCACION;
+  else if (estado == EST_BIFURCACION) estado = EST_RUN;
+
+  if (s3 == LINEA) {
+    // Centrado: ambos a velocidad base
+    set_motors(VEL_BASE, VEL_BASE, "AVANZA");
   }
-
-  // Posición = promedio de las posiciones de los sensores que ven la línea.
-  // En una intersección los extremos no cuentan: ven la otra rama, no la nuestra.
-  int suma = 0, n = 0;
-  if (!interseccion) {
-    if (v1) { suma -= 2; n++; }
-    if (v5) { suma += 2; n++; }
+  else if (s2 == LINEA) {
+    // Línea un poco a la izquierda: izquierdo en reversa, derecho adelante
+    set_motors(VEL_CORR, VEL_BASE, "CORRIGE_IZQ");
   }
-  if (v2) { suma -= 1; n++; }
-  if (v3) { n++; }
-  if (v4) { suma += 1; n++; }
-
-  static float e_valido = 0;           // última posición en la que sí se vio la línea
-  if (n > 0) {
-    e_valido = (float)suma / n;
-    error_linea = e_valido;
+  else if (s4 == LINEA) {
+    // Línea un poco a la derecha: izquierdo adelante, derecho en reversa
+    set_motors(VEL_BASE, VEL_CORR, "CORRIGE_DER");
   }
-  else if (e_valido <= -1.0f) error_linea = -E_PERDIDA;   // se salió por la izquierda: girar fuerte
-  else if (e_valido >=  1.0f) error_linea =  E_PERDIDA;   // se salió por la derecha
-  else                        error_linea = e_valido;     // hueco entre sensores: mantener
-}
-
-// Interrupción de Timer3 cada 2 ms: control PD.
-//   w = Kp*e + Kd*de/dt      izquierda = v + w      derecha = v - w
-// e < 0 (línea a la izquierda) -> w < 0 -> la rueda izquierda va más lento -> gira a la izquierda.
-// La D frena el giro cuando la línea ya viene volviendo al centro: eso quita el zigzag.
-void ISR_Control() {
-  if (estado != EST_RUN && estado != EST_BIFURCACION) return;
-
-  float e = error_linea;
-  float d = (e - e_anterior) / DT_CONTROL;
-  e_anterior = e;
-  d_filtrada += 0.1f * (d - d_filtrada);  // pasa-bajos (~20 ms): el error cambia en escalones
-
-  float w = Kp * e + Kd * d_filtrada;
-
-  // Más lento cuanto más lejos está la línea del centro (curvas)
-  float a = fabsf(e);
-  if (a > 2.0f) a = 2.0f;
-  float v = VEL_BASE * (1.0f - FRENO_CURVA * a / 2.0f);
-
-  int32_t izq = (int32_t)(v + w);
-  int32_t der = (int32_t)(v - w);
-  izq = constrain(izq, -VEL_REV_MAX, (int32_t)PWM_MAX);
-  der = constrain(der, -VEL_REV_MAX, (int32_t)PWM_MAX);
-  set_motors(izq, der, "PD");
-}
-
-void imprimir_pd() {
-  Serial.print(F("[PD] Kp = ")); Serial.print(Kp);
-  Serial.print(F("  Kd = ")); Serial.print(Kd);
-  Serial.print(F("  freno en curva = ")); Serial.println(FRENO_CURVA);
+  // Ningún sensor del medio: mantiene la última salida
 }
 
 // ============================================================================
@@ -468,11 +415,45 @@ void ISR_Color() {
 // Leer los 8 bytes juntos asegura que C, R, G y B son de la misma medición.
 bool tcs_leer(uint8_t reg, uint8_t *buf, uint8_t n) {
   BUS_COLOR.beginTransmission(TCS34725_ADDRESS);
-  BUS_COLOR.write((uint8_t)(TCS34725_COMMAND_BIT | 0x20 | reg));  // 0x20 = auto-incremento
+  BUS_COLOR.write((uint8_t)(TCS34725_COMMAND_BIT | TCS34725_AUTOINCREMENTO | reg));
   if (BUS_COLOR.endTransmission() != 0) return false;
   if (BUS_COLOR.requestFrom(TCS34725_ADDRESS, (int)n) != n) return false;
   for (uint8_t i = 0; i < n; i++) buf[i] = (uint8_t)BUS_COLOR.read();
   return true;
+}
+
+// Escribe un registro del TCS34725
+bool tcs_escribir(uint8_t reg, uint8_t valor) {
+  BUS_COLOR.beginTransmission(TCS34725_ADDRESS);
+  BUS_COLOR.write((uint8_t)(TCS34725_COMMAND_BIT | reg));
+  BUS_COLOR.write(valor);
+  return BUS_COLOR.endTransmission() == 0;
+}
+
+// Borra la interrupción del sensor (AINT) y suelta el pin INT
+bool tcs_limpiar_interrupcion() {
+  BUS_COLOR.beginTransmission(TCS34725_ADDRESS);
+  BUS_COLOR.write((uint8_t)TCS34725_LIMPIAR_INT);
+  return BUS_COLOR.endTransmission() == 0;
+}
+
+// Revisa el ID y deja el sensor midiendo, con interrupción en cada fin de medición.
+// Hace lo mismo que tcs.begin() + write8(PERS) + setInterrupt(true) + clearInterrupt().
+bool tcs_iniciar() {
+  uint8_t id;
+  if (!tcs_leer(TCS34725_ID, &id, 1)) return false;
+  if (id != 0x44 && id != 0x4D && id != 0x10) {
+    Serial.print(F("[ERROR] ID del sensor de color inesperado: 0x")); Serial.println(id, HEX);
+    return false;
+  }
+  if (!tcs_escribir(TCS34725_ATIME,   COLOR_T_INTEGRACION))  return false;  // 24 ms
+  if (!tcs_escribir(TCS34725_CONTROL, TCS34725_GAIN_4X))     return false;  // ganancia 4x
+  if (!tcs_escribir(TCS34725_PERS,    TCS34725_PERS_NONE))   return false;  // INT en cada medición
+  if (!tcs_escribir(TCS34725_ENABLE,  TCS34725_ENABLE_PON))  return false;  // encender
+  delay(3);                                                                 // 2.4 ms de arranque
+  if (!tcs_escribir(TCS34725_ENABLE,  TCS34725_ENABLE_PON | TCS34725_ENABLE_AEN | TCS34725_ENABLE_AIEN))
+    return false;                                                           // medir + interrupción
+  return tcs_limpiar_interrupcion();                                        // INT arranca en alto
 }
 
 void registrar_falla_color() {
@@ -505,7 +486,7 @@ void atender_sensor_color() {
 
   uint8_t b[8];                         // CDATAL, CDATAH, RDATAL, ... BDATAH (0x14..0x1B)
   if (!tcs_leer(TCS34725_CDATAL, b, 8)) { registrar_falla_color(); return; }
-  tcs.clearInterrupt();                 // borra AINT y suelta INT: la próxima medición da un flanco nuevo
+  tcs_limpiar_interrupcion();           // borra AINT y suelta INT: la próxima medición da un flanco nuevo
   fallas_color = 0;
   color_falla = false;
 
@@ -686,13 +667,12 @@ void publicar_estado() {
   interrupts();
 }
 
-// Pasa a RUN. El PD arranca desde la posición actual de la línea.
+// Pasa a RUN y calcula la primera salida: si el carro está quieto sobre la línea
+// ningún pin cambia, así que no habría interrupción que lo arranque.
 void arrancar() {
   noInterrupts();
-  ISR_Linea();                 // posición actual de la línea
-  e_anterior = error_linea;    // sin salto de derivada al arrancar
-  d_filtrada = 0;
-  estado = EST_RUN;            // ISR_Control mueve los motores desde el siguiente tick (≤ 2 ms)
+  estado = EST_RUN;
+  ISR_Linea();
   interrupts();
 }
 
@@ -728,7 +708,7 @@ void stop_motors() {
   set_motors(0, 0, "DETENIDO");
 }
 
-void set_motors(int32_t izq, int32_t der, const char* state) {
+void set_motors(int16_t izq, int16_t der, const char* state) {
   drive_motor(IN1, IN2, izq);   // motor izquierdo
   drive_motor(IN3, IN4, der);   // motor derecho
   vel_izq = izq;
@@ -741,16 +721,15 @@ void set_motors(int32_t izq, int32_t der, const char* state) {
 // v < 0: reversa  -> dir HIGH, PWM = PWM_MAX - |v|
 //        (en la parte alta del PWM ambos pines quedan en HIGH = freno)
 // v = 0: ambos en LOW -> freno
-// int32_t: con PWM_MAX = 65535 los valores pasan de 32767 y en int16_t se volverían negativos.
-void drive_motor(int pin_pwm, int pin_dir, int32_t v) {
-  uint32_t m = (v >= 0) ? (uint32_t)v : (uint32_t)(-v);
+void drive_motor(int pin_pwm, int pin_dir, int16_t v) {
+  uint16_t m = (v >= 0) ? (uint16_t)v : (uint16_t)(-v);
   if (m > PWM_MAX) m = PWM_MAX;
 
   if (v >= 0) {
     digitalWrite(pin_dir, LOW);
-    pwmWrite(pin_pwm, (uint16_t)m);
+    pwmWrite(pin_pwm, m);
   } else {
     digitalWrite(pin_dir, HIGH);
-    pwmWrite(pin_pwm, (uint16_t)(PWM_MAX - m));
+    pwmWrite(pin_pwm, PWM_MAX - m);
   }
 }
