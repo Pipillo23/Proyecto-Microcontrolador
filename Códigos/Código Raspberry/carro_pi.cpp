@@ -231,14 +231,16 @@ public:
     bool     sincronizado() const { return sincronizado_; }
     bool     versionMala() const { return versionMala_; }
     bool     startBloqueado() const { return startBloqueado_; }
+    const char* ultimaCausa() const { return ultCausa_; }
 
 private:
     uint8_t seqSiguiente();
     void encolar(uint8_t cmd);
     void quitarDeCola(uint8_t cmd);
-    void registrarError(uint64_t now)
+    void registrarError(uint64_t now, const char* causa)
     {
         tUltErr_ = now;
+        ultCausa_ = causa;
     }
     void enviarPendiente(uint64_t now);
     void iniciarEnvio(uint8_t cmd, uint64_t now);
@@ -253,6 +255,7 @@ private:
     bool     sincronizado_ = false;     /* ya se leyo al menos una trama valida       */
     bool     versionMala_ = false;
     uint64_t tUltOk_ = 0, tUltErr_ = 0, tUltEnvio_ = 0;
+    const char* ultCausa_ = "";        /* motivo del ultimo error, para la pantalla  */
     int      pubIguales_ = 0;
     uint8_t  sigSeq_ = 0;
 
@@ -294,7 +297,8 @@ void Enlace::enviarPendiente(uint64_t now)
     pendEnvios_++;
     pendT_ = now;
     tUltEnvio_ = now;
-    if (!bus_.escribir(pendTrama_.data(), pendTrama_.size())) registrarError(now);
+    if (!bus_.escribir(pendTrama_.data(), pendTrama_.size()))
+        registrarError(now, BusI2C::explicarErrno(errno));
 }
 
 void Enlace::iniciarEnvio(uint8_t cmd, uint64_t now)
@@ -403,11 +407,12 @@ void Enlace::tick(uint64_t now)
             procesarEstado(e, now);
             leido = true;
         } else {
-            registrarError(now);
+            registrarError(now, r == DEC_ERR_VERSION ? "version de protocolo distinta en el STM32"
+                                                     : "trama de estado con CRC incorrecto");
             if (r == DEC_ERR_VERSION) versionMala_ = true;
         }
     } else {
-        registrarError(now);
+        registrarError(now, BusI2C::explicarErrno(errno));
     }
 
     /* 2) Envios: STOP primero, luego confirmacion del pendiente, luego la cola */
@@ -433,7 +438,7 @@ void Enlace::tick(uint64_t now)
     if (now - tUltEnvio_ >= T_HEARTBEAT_MS) {
         std::array<uint8_t, CMD_LEN> t{};
         cmd_armar(t.data(), 0, CMD_HEARTBEAT);
-        if (!bus_.escribir(t.data(), t.size())) registrarError(now);
+        if (!bus_.escribir(t.data(), t.size())) registrarError(now, BusI2C::explicarErrno(errno));
         tUltEnvio_ = now;
     }
 }
@@ -741,6 +746,8 @@ void Interfaz::dibujar(uint64_t now)
     const char* txt = nv == 2 ? VERDE_T "OK" : nv == 1 ? AMAR_T "DEGRADADO" : ROJO_T "SIN CONEXION";
     p("Comunicacion : %s" NORM_T "%s" FIN, txt,
       enlace_.versionMala() ? ROJO_T "  VERSION INCOMPATIBLE" NORM_T : "");
+    if (nv != 2 && enlace_.ultimaCausa()[0])
+        p("Ultimo error : " AMAR_T "%s" NORM_T FIN, enlace_.ultimaCausa());
 
     const estado_t& e = enlace_.estado();
     if (!enlace_.sincronizado()) {
