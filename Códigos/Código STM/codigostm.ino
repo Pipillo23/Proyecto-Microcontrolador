@@ -2,7 +2,7 @@
 //     y no activa el I2C esclavo de la Pi. El sensor de color SÍ funciona, con la
 //     librería Wire normal (solo maestro), igual que en el código original.
 // PONERLO EN 0 PARA LA ENTREGA FINAL.
-#define MODO_SIN_PI 1
+#define MODO_SIN_PI 0
 
 #include <Arduino.h>
 #if MODO_SIN_PI
@@ -34,10 +34,23 @@ const int IR_S5 = PA7;
 const int LINEA = HIGH;
 
 // --- Velocidades (PWM en IN1 e IN3, 0 a PWM_MAX) ---
-const uint16_t PWM_MAX  = 65535;   
-const uint16_t VEL_BASE = 25000;   
-const uint16_t VEL_CORR = 20000;   
-const uint16_t VEL_GIRO = 20000;   
+const uint16_t PWM_MAX     = 65535;
+const int32_t  VEL_BASE    = 25000;   // velocidad en recta
+const int32_t  VEL_REV_MAX = 15000;   // reversa máxima de la rueda interior en curvas cerradas
+
+// --- Control PD de posición (ISR_Control, cada 2 ms por Timer3) ---
+// Error = posición de la línea medida en "sensores":
+//   -2 bajo S1 ... -1 bajo S2 ... 0 bajo S3 ... +1 bajo S4 ... +2 bajo S5
+//   (dos sensores vecinos a la vez dan el punto medio: -1.5, -0.5, +0.5, +1.5)
+// Se pueden cambiar por el Monitor Serie: p8000  d500  f0.3
+float Kp          = 8000.0f;  // cuentas de PWM por sensor de error
+float Kd          = 500.0f;   // cuentas de PWM por (sensor/s) de cambio del error
+float FRENO_CURVA = 0.30f;    // con el error máximo la velocidad base baja 30 %
+const uint32_t T_CONTROL_US = 2000;                  // 500 Hz
+const float    DT_CONTROL   = T_CONTROL_US * 1e-6f;
+const float    E_PERDIDA    = 2.5f;   // error cuando la línea se salió por un extremo
+volatile float error_linea  = 0;      // lo escribe ISR_Linea, lo lee ISR_Control
+float e_anterior = 0, d_filtrada = 0; // solo ISR_Control (y arrancar)
 
 // I2C1 por hardware, ESCLAVO 0x42 hacia la Raspberry Pi (pines fijos del periférico):
 //   PB6 = SCL -> GPIO3 (pin 5) de la Pi      PB7 = SDA -> GPIO2 (pin 3) de la Pi      GND común
@@ -124,11 +137,13 @@ unsigned long t_ult_publicacion = 0;
 unsigned long last_serial_print = 0;
 
 // Estado actual de las salidas (lo escribe el ISR, lo imprime loop)
-volatile int16_t vel_izq = 0, vel_der = 0;   // + adelante, - reversa
+volatile int32_t vel_izq = 0, vel_der = 0;   // + adelante, - reversa
 volatile const char* motor_state = "DETENIDO";
 
 // Prototipos
 void ISR_Linea();
+void ISR_Control();
+void imprimir_pd();
 void ISR_Color();
 void atender_sensor_color();
 bool tcs_leer(uint8_t reg, uint8_t *buf, uint8_t n);
@@ -147,13 +162,14 @@ void arrancar();
 void detener(uint8_t nuevo_estado);
 bool linea_perdida();
 void stop_motors();
-void set_motors(int16_t izq, int16_t der, const char* state);
-void drive_motor(int pin_pwm, int pin_dir, int16_t v);
+void set_motors(int32_t izq, int32_t der, const char* state);
+void drive_motor(int pin_pwm, int pin_dir, int32_t v);
 
 void setup() {
   // Puerto serie USB: solo para depurar con la PC (la Pi se comunica únicamente por I2C).
   // Sin "while (!Serial);": con el carro en batería no hay USB y el programa se quedaría ahí.
   Serial.begin(115200);
+  Serial.setTimeout(50);           // para leer las ganancias (p, d, f) sin trabar el loop
 
   pinMode(LED_PLACA, OUTPUT);
   digitalWrite(LED_PLACA, LOW);    // LED encendido: inicializando
@@ -232,6 +248,17 @@ void setup() {
   attachInterrupt(IR_S3, ISR_Linea, CHANGE);
   attachInterrupt(IR_S4, ISR_Linea, CHANGE);
   attachInterrupt(IR_S5, ISR_Linea, CHANGE);
+  ISR_Linea();                     // posición inicial de la línea
+
+  // --- Interrupción de control por Timer3 (500 Hz / 2 ms): el PD ---
+  // Timer2 genera el PWM; Timer3 solo marca el tiempo (canal 1 sin salida a pin).
+  Timer3.pause();
+  Timer3.setPeriod(T_CONTROL_US);                // en microsegundos
+  Timer3.setChannel1Mode(TIMER_OUTPUT_COMPARE);
+  Timer3.setCompare(TIMER_CH1, 1);
+  Timer3.attachCompare1Interrupt(ISR_Control);
+  Timer3.refresh();
+  Timer3.resume();
 
   digitalWrite(LED_PLACA, HIGH);   // LED apagado: setup() terminó
   Serial.println(F("[INFO] Sistema inicializado."));
@@ -251,6 +278,9 @@ void loop() {
   if (Serial.available()) {
     char c = Serial.read();
     if (c == 'b') calibrar_blanco();
+    else if (c == 'p') { Kp = Serial.parseFloat(); imprimir_pd(); }
+    else if (c == 'd') { Kd = Serial.parseFloat(); imprimir_pd(); }
+    else if (c == 'f') { FRENO_CURVA = Serial.parseFloat(); imprimir_pd(); }
 #if MODO_SIN_PI
     else if (c == 's' && estado == EST_IDLE) arrancar();
     else if (c == 'x') detener(EST_IDLE);
@@ -330,7 +360,8 @@ void loop() {
 
     // Copia consistente del estado de salidas
     noInterrupts();
-    int16_t vi = vel_izq, vd = vel_der;
+    int32_t vi = vel_izq, vd = vel_der;
+    float err = error_linea;
     const char* st = (const char*)motor_state;
     interrupts();
 
@@ -338,7 +369,8 @@ void loop() {
     Serial.print(F("/")); Serial.print(PWM_MAX);
     Serial.print(F(" | Der (IN3): ")); Serial.print(vd);
     Serial.print(F("/")); Serial.print(PWM_MAX);
-    Serial.print(F(" || Motores: ")); Serial.print(st);
+    Serial.print(F(" || error: ")); Serial.print(err);
+    Serial.print(F(" | Motores: ")); Serial.print(st);
     Serial.print(F(" | Estado: ")); Serial.println(estado_nombre(estado));
 
     Serial.print(F("[PROTOCOLO] ult_seq: ")); Serial.print(ult_seq);
@@ -349,38 +381,76 @@ void loop() {
   }
 }
 
-// Interrupción externa por cambio en cualquiera de los 5 sensores de línea
+// Interrupción externa por cambio en cualquiera de los 5 sensores de línea.
+// Ya NO mueve los motores: solo calcula dónde está la línea (error_linea) y detecta
+// intersecciones. Los motores los maneja ISR_Control a frecuencia fija.
 // Disposición: S1 (izq. extremo) - S2 - S3 (centro) - S4 - S5 (der. extremo)
-// Motor A = izquierdo (IN1/IN2), Motor B = derecho (IN3/IN4)
-// Seguimiento: solo S2, S3 y S4. Los extremos S1 y S5 solo detectan intersecciones.
-// Correcciones (S2/S4): bajan la velocidad de un lado
 void ISR_Linea() {
-  if (estado != EST_RUN && estado != EST_BIFURCACION) return;
-
-  int s1 = digitalRead(IR_S1);
-  int s2 = digitalRead(IR_S2);
-  int s3 = digitalRead(IR_S3);
-  int s4 = digitalRead(IR_S4);
-  int s5 = digitalRead(IR_S5);
+  bool v1 = digitalRead(IR_S1) == LINEA;
+  bool v2 = digitalRead(IR_S2) == LINEA;
+  bool v3 = digitalRead(IR_S3) == LINEA;
+  bool v4 = digitalRead(IR_S4) == LINEA;
+  bool v5 = digitalRead(IR_S5) == LINEA;
 
   // Intersección: los dos extremos ven línea a la vez. Se avisa a la Pi con
   // EST_BIFURCACION y se vuelve a RUN cuando los extremos dejan de verla.
-  if (s1 == LINEA && s5 == LINEA) estado = EST_BIFURCACION;
-  else if (estado == EST_BIFURCACION) estado = EST_RUN;
+  bool interseccion = v1 && v5;
+  if (estado == EST_RUN || estado == EST_BIFURCACION) {
+    if (interseccion) estado = EST_BIFURCACION;
+    else if (estado == EST_BIFURCACION) estado = EST_RUN;
+  }
 
-  if (s3 == LINEA) {
-    // Centrado: ambos a velocidad base
-    set_motors(VEL_BASE, VEL_BASE, "AVANZA");
+  // Posición = promedio de las posiciones de los sensores que ven la línea.
+  // En una intersección los extremos no cuentan: ven la otra rama, no la nuestra.
+  int suma = 0, n = 0;
+  if (!interseccion) {
+    if (v1) { suma -= 2; n++; }
+    if (v5) { suma += 2; n++; }
   }
-  else if (s2 == LINEA) {
-    // Línea un poco a la izquierda: izquierdo en reversa, derecho adelante
-    set_motors(VEL_CORR, VEL_BASE, "CORRIGE_IZQ");
+  if (v2) { suma -= 1; n++; }
+  if (v3) { n++; }
+  if (v4) { suma += 1; n++; }
+
+  static float e_valido = 0;           // última posición en la que sí se vio la línea
+  if (n > 0) {
+    e_valido = (float)suma / n;
+    error_linea = e_valido;
   }
-  else if (s4 == LINEA) {
-    // Línea un poco a la derecha: izquierdo adelante, derecho en reversa
-    set_motors(VEL_BASE, VEL_CORR, "CORRIGE_DER");
-  }
-  // Ningún sensor del medio: mantiene la última salida
+  else if (e_valido <= -1.0f) error_linea = -E_PERDIDA;   // se salió por la izquierda: girar fuerte
+  else if (e_valido >=  1.0f) error_linea =  E_PERDIDA;   // se salió por la derecha
+  else                        error_linea = e_valido;     // hueco entre sensores: mantener
+}
+
+// Interrupción de Timer3 cada 2 ms: control PD.
+//   w = Kp*e + Kd*de/dt      izquierda = v + w      derecha = v - w
+// e < 0 (línea a la izquierda) -> w < 0 -> la rueda izquierda va más lento -> gira a la izquierda.
+// La D frena el giro cuando la línea ya viene volviendo al centro: eso quita el zigzag.
+void ISR_Control() {
+  if (estado != EST_RUN && estado != EST_BIFURCACION) return;
+
+  float e = error_linea;
+  float d = (e - e_anterior) / DT_CONTROL;
+  e_anterior = e;
+  d_filtrada += 0.1f * (d - d_filtrada);  // pasa-bajos (~20 ms): el error cambia en escalones
+
+  float w = Kp * e + Kd * d_filtrada;
+
+  // Más lento cuanto más lejos está la línea del centro (curvas)
+  float a = fabsf(e);
+  if (a > 2.0f) a = 2.0f;
+  float v = VEL_BASE * (1.0f - FRENO_CURVA * a / 2.0f);
+
+  int32_t izq = (int32_t)(v + w);
+  int32_t der = (int32_t)(v - w);
+  izq = constrain(izq, -VEL_REV_MAX, (int32_t)PWM_MAX);
+  der = constrain(der, -VEL_REV_MAX, (int32_t)PWM_MAX);
+  set_motors(izq, der, "PD");
+}
+
+void imprimir_pd() {
+  Serial.print(F("[PD] Kp = ")); Serial.print(Kp);
+  Serial.print(F("  Kd = ")); Serial.print(Kd);
+  Serial.print(F("  freno en curva = ")); Serial.println(FRENO_CURVA);
 }
 
 // ============================================================================
@@ -616,12 +686,13 @@ void publicar_estado() {
   interrupts();
 }
 
-// Pasa a RUN y calcula la primera salida: si el carro está quieto sobre la línea
-// ningún pin cambia, así que no habría interrupción que lo arranque.
+// Pasa a RUN. El PD arranca desde la posición actual de la línea.
 void arrancar() {
   noInterrupts();
-  estado = EST_RUN;
-  ISR_Linea();
+  ISR_Linea();                 // posición actual de la línea
+  e_anterior = error_linea;    // sin salto de derivada al arrancar
+  d_filtrada = 0;
+  estado = EST_RUN;            // ISR_Control mueve los motores desde el siguiente tick (≤ 2 ms)
   interrupts();
 }
 
@@ -657,7 +728,7 @@ void stop_motors() {
   set_motors(0, 0, "DETENIDO");
 }
 
-void set_motors(int16_t izq, int16_t der, const char* state) {
+void set_motors(int32_t izq, int32_t der, const char* state) {
   drive_motor(IN1, IN2, izq);   // motor izquierdo
   drive_motor(IN3, IN4, der);   // motor derecho
   vel_izq = izq;
@@ -670,15 +741,16 @@ void set_motors(int16_t izq, int16_t der, const char* state) {
 // v < 0: reversa  -> dir HIGH, PWM = PWM_MAX - |v|
 //        (en la parte alta del PWM ambos pines quedan en HIGH = freno)
 // v = 0: ambos en LOW -> freno
-void drive_motor(int pin_pwm, int pin_dir, int16_t v) {
-  uint16_t m = (v >= 0) ? (uint16_t)v : (uint16_t)(-v);
+// int32_t: con PWM_MAX = 65535 los valores pasan de 32767 y en int16_t se volverían negativos.
+void drive_motor(int pin_pwm, int pin_dir, int32_t v) {
+  uint32_t m = (v >= 0) ? (uint32_t)v : (uint32_t)(-v);
   if (m > PWM_MAX) m = PWM_MAX;
 
   if (v >= 0) {
     digitalWrite(pin_dir, LOW);
-    pwmWrite(pin_pwm, m);
+    pwmWrite(pin_pwm, (uint16_t)m);
   } else {
     digitalWrite(pin_dir, HIGH);
-    pwmWrite(pin_pwm, PWM_MAX - m);
+    pwmWrite(pin_pwm, (uint16_t)(PWM_MAX - m));
   }
 }
