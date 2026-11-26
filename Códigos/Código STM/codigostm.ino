@@ -24,14 +24,14 @@ const int IN3 = PA3;   // PWM (TIM2 CH4) - motor derecho
 const int IN4 = PA4;   // dirección motor derecho (LOW adelante / HIGH reversa)
 
 // Seguidor de Pista (5 Canales: S1 izq. extremo ... S5 der. extremo)
-const int IR_S1 = PB0;
-const int IR_S2 = PB1;
+const int IR_S1 = PB14;
+const int IR_S2 = PB0;
 const int IR_S3 = PB12;
 const int IR_S4 = PB13;
-const int IR_S5 = PB14;
+const int IR_S5 = PA7;
 
 // Nivel que entrega el sensor cuando está SOBRE la línea
-const int LINEA = LOW;
+const int LINEA = HIGH;
 
 // --- Velocidades (PWM en IN1 e IN3, 0 a PWM_MAX) ---
 const uint16_t PWM_MAX  = 65535;   
@@ -374,11 +374,11 @@ void ISR_Linea() {
   }
   else if (s2 == LINEA) {
     // Línea un poco a la izquierda: izquierdo en reversa, derecho adelante
-    set_motors(-(int16_t)VEL_CORR, VEL_BASE, "CORRIGE_IZQ");
+    set_motors(VEL_CORR, VEL_BASE, "CORRIGE_IZQ");
   }
   else if (s4 == LINEA) {
     // Línea un poco a la derecha: izquierdo adelante, derecho en reversa
-    set_motors(VEL_BASE, -(int16_t)VEL_CORR, "CORRIGE_DER");
+    set_motors(VEL_BASE, VEL_CORR, "CORRIGE_DER");
   }
   // Ningún sensor del medio: mantiene la última salida
 }
